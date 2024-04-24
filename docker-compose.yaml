@@ -1,0 +1,11 @@
+version: '3'
+
+services:
+  ai_evaluation:
+    build: .
+    container_name: ai_evaluation
+    environment:
+      - KAFKA_HOST=192.168.19.2
+      - KAFKA_PORT=9092
+      - MYSQL_HOST=192.168.19.2
+    restart: always
