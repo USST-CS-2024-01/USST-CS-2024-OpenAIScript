@@ -17,6 +17,21 @@ consumer = KafkaConsumer(
 mysql_conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD,
                              database=MYSQL_DATABASE)
 
+ERROR_TABLE = {
+    -1: "Unknown error",
+    -2: "Conversion timeout error",
+    -3: "Conversion error",
+    -4: "Error while downloading the document file to be converted",
+    -5: "Incorrect password",
+    -6: "Error while accessing the conversion result database",
+    -7: "Input error",
+    -8: "Invalid token",
+    -9: "Error when the converter cannot automatically determine the output file format. "
+        "This error means that the client must explicitly specify in which format the file "
+        "should be converted (text document or spreadsheet). It is used to convert XML to "
+        "OOXML in case the XML type is unknown",
+}
+
 
 def update_task_status(task_id, status, doc_evaluation: {}, overall_score: 0):
     try:
@@ -73,16 +88,19 @@ def start_task(message):
         logging.error(f"Error processing message [{message}]: {e}")
         return
 
-    logging.info(f"Starting task {task_id}")
-
     try:
+        update_task_status(task_id, 'pending', {
+        }, 0)
         result = requests.post(onlyoffice_url, json=param,
                                headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
         if result.status_code >= 400:
             logging.error(f"Error sending document evaluation request: {result.text}")
             raise RuntimeError(f"Error sending document evaluation request: {result.text}")
+        if 'error' in result.json():
+            raise RuntimeError(f"Error sending document evaluation request: "
+                               f"{ERROR_TABLE.get(result.json()['error'], 'Unknown error')}")
         file_url = result.json()['fileUrl']
-        data = requests.get(file_url).text
+        data = requests.get(file_url).content.decode('utf-8')
         score, comment = openai.evaluate_document(
             document=data,
             model=conf.get('openai:model'),
