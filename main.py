@@ -1,21 +1,33 @@
 import json
 import logging
-
 import pymysql
 import requests
 from kafka import KafkaConsumer
-
 import openai
 from config import KAFKA_TOPIC, KAFKA_HOST, KAFKA_PORT, MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, \
     MYSQL_DATABASE
 
+# Initialize Kafka consumer
 consumer = KafkaConsumer(
     KAFKA_TOPIC,
     bootstrap_servers=f"{KAFKA_HOST}:{KAFKA_PORT}",
     client_id="python-openai-consumer"
 )
-mysql_conn = pymysql.connect(host=MYSQL_HOST, port=MYSQL_PORT, user=MYSQL_USER, password=MYSQL_PASSWORD,
-                             database=MYSQL_DATABASE)
+
+
+# Define a function to establish a MySQL connection
+def get_mysql_connection():
+    return pymysql.connect(
+        host=MYSQL_HOST,
+        port=MYSQL_PORT,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE
+    )
+
+
+# Initialize MySQL connection
+mysql_conn = get_mysql_connection()
 
 ERROR_TABLE = {
     -1: "Unknown error",
@@ -33,7 +45,21 @@ ERROR_TABLE = {
 }
 
 
-def update_task_status(task_id, status, doc_evaluation: {}, overall_score: 0):
+def execute_with_reconnect(func):
+    def wrapper(*args, **kwargs):
+        global mysql_conn
+        try:
+            return func(*args, **kwargs)
+        except pymysql.MySQLError as e:
+            logging.error(f"MySQL error: {e}. Attempting to reconnect.")
+            mysql_conn = get_mysql_connection()
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+@execute_with_reconnect
+def update_task_status(task_id, status, doc_evaluation, overall_score):
     try:
         sql = "UPDATE ai_doc_score_record SET status = %s, doc_evaluation = %s, overall_score = %s, score_time=NOW() WHERE id = %s"
         with mysql_conn.cursor() as cursor:
@@ -43,6 +69,7 @@ def update_task_status(task_id, status, doc_evaluation: {}, overall_score: 0):
         logging.error(f"Error updating task {task_id} status: {e}")
 
 
+@execute_with_reconnect
 def check_task_exist(task_id):
     try:
         sql = "SELECT COUNT(*) FROM ai_doc_score_record WHERE id = %s"
@@ -55,6 +82,7 @@ def check_task_exist(task_id):
         return False
 
 
+@execute_with_reconnect
 def get_config():
     options = [
         'openai:endpoint',
@@ -89,16 +117,15 @@ def start_task(message):
         return
 
     try:
-        update_task_status(task_id, 'pending', {
-        }, 0)
+        update_task_status(task_id, 'pending', {}, 0)
         result = requests.post(onlyoffice_url, json=param,
                                headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
         if result.status_code >= 400:
             logging.error(f"Error sending document evaluation request: {result.text}")
             raise RuntimeError(f"Error sending document evaluation request: {result.text}")
         if 'error' in result.json():
-            raise RuntimeError(f"Error sending document evaluation request: "
-                               f"{ERROR_TABLE.get(result.json()['error'], 'Unknown error')}")
+            raise RuntimeError(
+                f"Error sending document evaluation request: {ERROR_TABLE.get(result.json()['error'], 'Unknown error')}")
         file_url = result.json()['fileUrl']
         data = requests.get(file_url).content.decode('utf-8')
         score, comment = openai.evaluate_document(
@@ -108,14 +135,10 @@ def start_task(message):
             secret_key=conf.get('openai:secret_key'),
             prompt=conf.get('openai:prompt'),
         )
-        update_task_status(task_id, 'completed', {
-            "comment": comment,
-        }, score)
+        update_task_status(task_id, 'completed', {"comment": comment}, score)
     except Exception as e:
         logging.error(f"Error processing task {task_id}: {e}")
-        update_task_status(task_id, 'failed', {
-            "error": str(e),
-        }, 0)
+        update_task_status(task_id, 'failed', {"error": str(e)}, 0)
 
     logging.info(f"Task {task_id} completed")
 
